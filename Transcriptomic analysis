@@ -1,0 +1,245 @@
+# Загрузка библиотек
+suppressPackageStartupMessages({
+  library(GenomicFeatures)
+  library(tximport)
+  library(DESeq2)
+  library(clusterProfiler)
+  library(org.Hs.eg.db)
+  library(pathview)
+  library(ReactomePA)
+  library(EnhancedVolcano)
+  library(ggplot2)
+  library(pheatmap)
+  library(reshape2)
+  library(enrichplot)
+  library(msigdbr)
+})
+
+# 1. Создание tx2gene
+# Указать путь к GFF3
+txdb <- makeTxDbFromGFF("/run/media/bmo/пам-ПАМ/биофак/diploma/A549/ref/Homo_sapiens.GRCh38.113.gff3")
+transcripts <- transcripts(txdb, columns = c("TXNAME", "GENEID"))
+tx2gene <- as.data.frame(mcols(transcripts))
+tx2gene$GENEID <- as.character(tx2gene$GENEID)
+tx2gene$TXNAME <- as.character(tx2gene$TXNAME)
+
+# 2. Определение групп и файлов
+samples <- c("no treatment", "low dose", "medium dose", "high dose")
+files <- c(
+  "/run/media/bmo/пам-ПАМ/биофак/diploma/A549/results_cDNA/77/abundance.h5", 
+  "/run/media/bmo/пам-ПАМ/биофак/diploma/A549/results_cDNA/76/abundance.h5", 
+  "/run/media/bmo/пам-ПАМ/биофак/diploma/A549/results_cDNA/74/abundance.h5", 
+  "/run/media/bmo/пам-ПАМ/биофак/diploma/A549/results_cDNA/78/abundance.h5"
+)
+names(files) <- samples
+
+# 3. Импорт с Kallisto
+txi <- tximport(files, type = "kallisto", tx2gene = tx2gene, ignoreTxVersion = TRUE)
+txi$counts <- as.matrix(txi$counts)
+
+# 4. colData и DESeq2-объект
+coldata <- data.frame(row.names = colnames(txi$counts), condition = c("0", "3", "7.5", "15"))
+coldata$condition <- factor(coldata$condition, levels = c("0", "3", "7.5", "15"))
+
+# Создание директории вывода
+output_dir <- "/run/media/bmo/пам-ПАМ/биофак/diploma/A549/new_res_DNA/3_vs_0/"
+
+# 5. DESeq2-анализ
+dds <- DESeqDataSetFromTximport(txi, colData = coldata, design = ~ condition)
+sizeFactors(dds) <- rep(1, ncol(dds))
+dispersions(dds) <- rep(0.1, nrow(dds))
+dds <- nbinomWaldTest(dds)
+
+# 6. VST и PCA
+vsd <- vst(dds)
+pca_plot <- plotPCA(vsd, intgroup = "condition") + theme(aspect.ratio = 1)
+png(paste0(output_dir, "/PCA_plot.png"),width = 800, height = 800, res = 200, name = 'PCA')
+print(pca_plot)
+dev.off()
+
+# 7. Матрица корреляции
+sample_cor <- cor(assay(vsd))
+annotation_col <- data.frame(condition = coldata$condition)
+rownames(annotation_col) <- rownames(coldata)
+png(paste0(output_dir, "/sample_correlation_heatmap.png"), width = 800, height = 700, res = 200)
+pheatmap(sample_cor, main = "Sample-to-sample correlation",
+         color = colorRampPalette(c("blue", "white", "red"))(100))
+dev.off()
+
+# 8. Контраст и результаты
+contrast_name <- "3_vs_0"
+contrast <- "condition_3_vs_0"
+res <- lfcShrink(dds, coef = contrast, type = "normal")
+
+# 9. Аннотация
+res$gene_symbols <- mapIds(org.Hs.eg.db, keys = rownames(res), column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+res$gene_description <- mapIds(org.Hs.eg.db, keys = rownames(res), column = "GENENAME", keytype = "ENSEMBL", multiVals = "first")
+
+# 10. Сохранение результатов
+write.csv(as.data.frame(res), file = paste0(output_dir, "/DE_results_", contrast_name, ".csv"))
+
+# 11. MA-плот
+png(paste0(output_dir, "/MA_plot_", contrast_name, ".png"), width = 1200, height = 1000, res = 120)
+plotMA(res, ylim = c(-10, 10), main = paste0("MA Plot: ", contrast_name))
+dev.off()
+
+# 12. Volcano plot
+png(paste0(output_dir, "/Volcano_", contrast_name, ".png"), width = 1200, height = 1500, res = 120)
+EnhancedVolcano(res, lab = res$gene_symbols, x = "log2FoldChange", y = "padj", pCutoff = 0.05,
+                FCcutoff = 1, title = paste0("Volcano Plot: ", contrast_name), pointSize = 2, labSize = 4)
+dev.off()
+
+# 13. DEG фильтрация
+sig_genes <- res[!is.na(res$padj) & !is.na(res$log2FoldChange) & res$padj < 0.05 & abs(res$log2FoldChange) > 1, ]
+sig_genes <- sig_genes[!is.na(sig_genes$gene_symbols) & sig_genes$gene_symbols != "" & sig_genes$gene_symbols != "NA", ]
+write.csv(as.data.frame(sig_genes), file = paste0(output_dir, "/DE_results_filtered_", contrast_name, ".csv"))
+
+# 16. KEGG-анализ
+up_genes <- sig_genes[sig_genes$log2FoldChange > 1, ]
+down_genes <- sig_genes[sig_genes$log2FoldChange < -1, ]
+
+up_entrez_ids <- na.omit(mapIds(org.Hs.eg.db, keys = rownames(up_genes), column = "ENTREZID", keytype = "ENSEMBL", multiVals = "first"))
+down_entrez_ids <- na.omit(mapIds(org.Hs.eg.db, keys = rownames(down_genes), column = "ENTREZID", keytype = "ENSEMBL", multiVals = "first"))
+
+up_kegg <- enrichKEGG(gene = up_entrez_ids, organism = "hsa", pvalueCutoff = 0.05, qvalueCutoff = 0.1)
+down_kegg <- enrichKEGG(gene = down_entrez_ids, organism = "hsa", pvalueCutoff = 0.05, qvalueCutoff = 0.1)
+
+write.csv(as.data.frame(up_kegg), file = paste0(output_dir, "/KEGG_upregulated_", contrast_name, ".csv"))
+write.csv(as.data.frame(down_kegg), file = paste0(output_dir, "/KEGG_downregulated_", contrast_name, ".csv"))
+
+png(paste0(output_dir, "/KEGG_barplot_upregulated_", contrast_name, ".png"), width = 1000, height = 1500, res = 120)
+barplot(up_kegg,
+        showCategory = min(50, nrow(as.data.frame(up_kegg))),
+        title = paste0("KEGG Barplot (upregulated): ", contrast_name))
+dev.off()
+
+png(paste0(output_dir, "/KEGG_barplot_downregulated_", contrast_name, ".png"), width = 800, height = 1200, res = 120)
+barplot(down_kegg,
+        showCategory = min(50, nrow(as.data.frame(down_kegg))),
+        title = paste0("KEGG Barplot (downregulated): ", contrast_name))
+dev.off()
+
+png(paste0(output_dir, "/KEGG_dotplot_up", contrast_name, ".png"), width = 1000, height = 1500, res = 120)
+dotplot(up_kegg, showCategory = 50, title = paste0("KEGG Dotplot (upregulated): ", contrast_name))
+dev.off()
+
+png(paste0(output_dir, "/KEGG_dotplot_down", contrast_name, ".png"), width = 800, height = 1200, res = 120)
+dotplot(down_kegg, showCategory = 50, title = paste0("KEGG Dotplot (downregulated): ", contrast_name))
+dev.off()
+
+
+# 17. GSEA-анализ по Hallmark
+# 17.2 Подготовка ranked list по SYMBOL
+res_rn <- res[!is.na(res$log2FoldChange) & !is.na(res$gene_symbols), ]
+res_rn <- res_rn[!duplicated(res_rn$gene_symbols), ]
+gene_list <- sort(setNames(res_rn$log2FoldChange, res_rn$gene_symbols), decreasing = TRUE)
+
+# 17.3 Hallmark gene sets (SYMBOL)
+hallmark_sets <- msigdbr(species = "Homo sapiens", category = "H")[, c("gs_name", "gene_symbol")]
+colnames(hallmark_sets) <- c("ID", "gene")
+# 
+# 17.4 Запуск GSEA
+set.seed(123)
+gsea_all <- GSEA(geneList      = gene_list,
+                 TERM2GENE     = hallmark_sets,
+                 pvalueCutoff  = 1,
+                 pAdjustMethod = "BH",
+                 minGSSize     = 15,
+                 maxGSSize     = 500,
+                 verbose       = FALSE)
+
+# 17.5 Очистка результатов
+res_all <- gsea_all@result
+res_clean <- subset(res_all, is.finite(NES) & !is.na(p.adjust))
+gsea_all@result <- res_clean
+
+# 17.6 Фильтрация значимых путей
+sig_gsea <- subset(res_clean, p.adjust <= 0.25 & abs(NES) >= 1)
+
+# 17.7 Сохранение результатов
+write.csv(res_all,  file = file.path(output_dir, "GSEA_Hallmark_full.csv"), row.names = FALSE)
+write.csv(sig_gsea, file = file.path(output_dir, "GSEA_Hallmark_sig.csv"),  row.names = FALSE)
+
+# ID EMT-набора
+emt_id <- sig_gsea$ID[sig_gsea$Description == "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]
+# 
+# 17.8.1 Enrichment plot для EMT
+png(file.path(output_dir, paste0("GSEA_EMT_enrichmentplot_", contrast_name, ".png")),
+    width = 2000, height = 1500, res = 250)
+gseaplot2(gsea_all, geneSetID = emt_id,
+          title = paste0("EMT GSEA (NES=", round(sig_gsea$NES[sig_gsea$ID == emt_id], 2),
+                         ", FDR=", round(sig_gsea$p.adjust[sig_gsea$ID == emt_id], 3), ") 3_vs_0"))
+dev.off()
+
+# 17.8.2 Dotplot по значимым путям
+png(file.path(output_dir, paste0("GSEA_dotplot_sig_", contrast_name, ".png")),
+    width = 2500, height = 2500, res = 300)
+dotplot(gsea_all, showCategory = min(20, nrow(sig_gsea)),
+        title = "GSEA Dotplot: significant Hallmark sets")
+dev.off()
+
+# 17.8.3 Ridgeplot по значимым путям
+png(file.path(output_dir, paste0("GSEA_ridgeplot_sig_", contrast_name, ".png")),
+    width = 2500, height = 3000, res = 300)
+ridgeplot(gsea_all, showCategory = min(20, nrow(sig_gsea))) +
+  labs(title = "GSEA Ridgeplot: significant Hallmark sets 3_vs_0")
+dev.off()
+
+# 17.8.4 Cnetplot для EMT
+png(file.path(output_dir, paste0(" GSEA_cnetplot_EMT_", contrast_name, ".png")),
+    width = 3700, height = 3000, res = 300)
+cnetplot(gsea_all, category = emt_id, foldChange = gene_list,
+         circular = FALSE, colorEdge = TRUE) +
+  labs(title = "GSEA Cnetplot: EMT")
+dev.off()
+
+# 17.8.5 Heatmap ведущей кромки (leading edge) для EMT
+# 1) Извлекаем строку core_enrichment для EMT
+le_str   <- gsea_all@result$core_enrichment[gsea_all@result$ID == emt_id]
+le_genes <- strsplit(le_str, "/")[[1]]  # вектор SYMBOL
+
+# 2) Маппим SYMBOL → ENSEMBL ID
+symbol2ens <- mapIds(org.Hs.eg.db,
+                     keys   = le_genes,
+                     column = "ENSEMBL",
+                     keytype= "SYMBOL",
+                     multiVals = "first")
+
+# 3) Берём только те, что успешно сопоставились и есть в vsd
+ens_keep <- symbol2ens[!is.na(symbol2ens) & symbol2ens %in% rownames(vsd)]
+symbol_keep <- names(ens_keep)
+
+# 4) Формируем матрицу: строки по ENSEMBL, но переименуем в SYMBOL
+le_mat <- assay(vsd)[ens_keep, , drop = FALSE]
+rownames(le_mat) <- symbol_keep
+
+# Оставляем только интересующие условия
+keep_samples <- colnames(vsd)[coldata$condition %in% c("0", "3")]
+le_mat <- le_mat[, keep_samples, drop = FALSE]
+
+# Пересоздаём annotation_col правильно
+annotation_col <- data.frame(
+  condition = factor(c("0", "15"), levels = c("0", "3", "7.5", "15"))
+)
+rownames(annotation_col) <- c("no treatment", "low dose")
+
+# 5) Строим heatmap
+png(file.path(output_dir, paste0("GSEA_leadingEdge_heatmap_EMT_", contrast_name, ".png")),
+    width = 2000, height = 3200, res = 300)
+
+sig_le <- res[rownames(res) %in% ens_keep, ]
+sig_row <- data.frame(padj = sig_le$padj, row.names = names(ens_keep))
+# Вычисляем стандартное отклонение по строкам
+row_sds <- apply(le_mat, 1, sd)
+
+# Фильтруем строки с ненулевым sd
+le_mat_filtered <- le_mat[row_sds > 0, , drop = FALSE]
+
+# Обновляем sig_row для тех же строк
+sig_row_filtered <- sig_row[rownames(le_mat_filtered), , drop = FALSE]
+
+pheatmap(le_mat_filtered, scale = "row",
+         annotation_col = annotation_col,
+         annotation_row = sig_row_filtered,
+         main = "Leading Edge Heatmap: EMT 3_vs_0")
+dev.off()
